@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 # required if project and package name differ
 [tool.hatch.build.targets.wheel]
-packages = ["src/project_name"]
+packages = ["src/heatmit"]
 
 [project]
-name = "project-name"
-authors = [{ name = "author name", email = "author@email.com" }]
-description = "Project description"
+name = "heat-mitigation-suggestion"
+authors = [{name = "Lorenzo Innocenti", email = "lorenzo.innocenti@polito.it"}]
+description = " "
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -21,6 +21,20 @@ classifiers = [
 # Dynamic metadata allow to assign the version number to the package at build time.
 # The location of the version number is specified in the [tool.hatch.version] section.
 dynamic = ["version"]
+dependencies = [
+    "accelerate>=1.13.0",
+    "beautifulsoup4>=4.14.3",
+    "numpy>=2.2.6",
+    "pdfplumber>=0.11.9",
+    "pillow>=12.2.0",
+    "qwen-vl-utils>=0.0.14",
+    "rasterio>=1.4.4",
+    "requests>=2.33.1",
+    "sentence-transformers>=5.4.1",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "transformers>=5.7.0",
+]
 
 # Optional dependencies, use this to include everything that the project needs to run in development.
 # These can be installed by specifying for instance `uv sync --extra dev` o 'uv sync --all-extras'.
@@ -44,7 +58,7 @@ test = [
 ]
 
 [tool.hatch.version]
-path = "src/project_name/version.py"
+path = "src/heatmit/version.py"
 
 [tool.ruff]
 line-length = 119

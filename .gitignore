@@ -155,3 +155,8 @@ cython_debug/
 # IDE and editors
 .idea/
 .vscode/
+.claude/
+
+
+
+*.ckpt

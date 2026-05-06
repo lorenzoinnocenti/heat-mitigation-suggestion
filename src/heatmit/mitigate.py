@@ -8,7 +8,7 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 EMBED_MODEL_ID = "all-MiniLM-L6-v2"
-LLM_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
+LLM_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 DATA_DIR = Path("/nfs/home/innocenti/heat-mitigation-suggestion/data")
 
 # Multi-source corpus: web pages + PDFs
@@ -125,7 +125,8 @@ def suggest_mitigations(scene_description: str, rag: RAG) -> str:
     """
     context = "\n\n---\n\n".join(rag.retrieve(scene_description))
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    from heatmit.suggest import _get_device
+    device = _get_device()
     tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_ID)
     model = AutoModelForCausalLM.from_pretrained(
         LLM_MODEL_ID,
@@ -163,7 +164,11 @@ def suggest_mitigations(scene_description: str, rag: RAG) -> str:
         output_ids = model.generate(**inputs, max_new_tokens=1500, do_sample=False)
 
     generated = output_ids[0][inputs.input_ids.shape[1] :]
-    return tokenizer.decode(generated, skip_special_tokens=True)
+    result = tokenizer.decode(generated, skip_special_tokens=True)
+
+    del model, tokenizer, inputs
+    torch.cuda.empty_cache()
+    return result
 
 
 if __name__ == "__main__":
@@ -171,56 +176,72 @@ if __name__ == "__main__":
     import rasterio
     from rasterio.crs import CRS
     from rasterio.warp import calculate_default_transform, reproject, Resampling
-    from heatmit.suggest import _s2_to_rgb, describe_scene
+    from heatmit.suggest import _s2_to_rgb, _super_resolve, describe_scene
 
-    TIF = Path("/nfs/home/innocenti/heat-mitigation-suggestion/turin.tif")
+    S2_TIF = Path("/nfs/home/innocenti/heat-mitigation-suggestion/resources/sent2.tif")
     OUT = Path("/nfs/home/innocenti/heat-mitigation-suggestion/outputs")
-    CROP = 224
+    CROP = 128  # 128 px × 10 m = 1280 m; after 4× SR → 512 px at 2.5 m
     TARGET_CRS = CRS.from_epsg(32632)
-    TARGET_RES = 10.0
+    TARGET_RES = 20.0
 
-    # --- 1. Load, reproject and resample to 5 m/px ---
-    print("Reprojecting turin.tif to EPSG:32632 at 5 m/px...")
-    with rasterio.open(TIF) as src:
-        transform, width, height = calculate_default_transform(
-            src.crs, TARGET_CRS, src.width, src.height,
-            *src.bounds, resolution=TARGET_RES,
-        )
-        reprojected = np.zeros((src.count, height, width), dtype=np.float32)
-        for band in range(1, src.count + 1):
-            reproject(
-                source=rasterio.band(src, band),
-                destination=reprojected[band - 1],
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=transform,
-                dst_crs=TARGET_CRS,
-                resampling=Resampling.bilinear,
+    def _reproject_tif(path: Path) -> np.ndarray:
+        with rasterio.open(path) as src:
+            t, w, h = calculate_default_transform(
+                src.crs, TARGET_CRS, src.width, src.height,
+                *src.bounds, resolution=TARGET_RES,
             )
+            out = np.zeros((src.count, h, w), dtype=np.float32)
+            for band in range(1, src.count + 1):
+                reproject(
+                    source=rasterio.band(src, band),
+                    destination=out[band - 1],
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=t,
+                    dst_crs=TARGET_CRS,
+                    resampling=Resampling.bilinear,
+                )
+        return out  # (bands, H, W)
 
-    # --- 2. Random 224×224 crop ---
+    # --- 1. Load and reproject S2 ---
+    print("Reprojecting resources/sent2.tif to EPSG:32632 at 10 m/px...")
+    s2_data = _reproject_tif(S2_TIF)
+    _, height, width = s2_data.shape
+
+    # --- 2. Random 56×56 crop ---
     col = random.randint(0, width - CROP)
     row = random.randint(0, height - CROP)
-    patch = reprojected[:, row:row + CROP, col:col + CROP]
-    s2_patch = np.transpose(patch, (1, 2, 0))  # (H, W, 4)
+    s2_patch = np.transpose(s2_data[:, row:row + CROP, col:col + CROP], (1, 2, 0))  # (H, W, 4)
 
     OUT.mkdir(exist_ok=True)
 
-    # --- 3. Save RGB PNG ---
-    png_path = OUT / f"{row}_{col}.png"
-    _s2_to_rgb(s2_patch).save(png_path)
-    print(f"Saved: {png_path}")
+    # --- 3. Save original PNG ---
+    s2_png = OUT / f"{row}_{col}_s2.png"
+    _s2_to_rgb(s2_patch).save(s2_png)
+    print(f"Saved: {s2_png}")
 
-    # --- 4. Describe scene ---
+    # --- 4. Super-resolve S2 (16×) and save PNGs ---
+    print("Super-resolving S2 patch (16×)...")
+    s2_x4, s2_x16 = _super_resolve(s2_patch)
+
+    s2_x4_png = OUT / f"{row}_{col}_s2_x4.png"
+    _s2_to_rgb(s2_x4).save(s2_x4_png)
+    print(f"Saved: {s2_x4_png}")
+
+    s2_x16_png = OUT / f"{row}_{col}_s2_x16.png"
+    _s2_to_rgb(s2_x16).save(s2_x16_png)
+    print(f"Saved: {s2_x16_png}")
+
+    # --- 5. Describe scene ---
     print("Describing scene with Qwen2.5-VL-3B...")
-    description = describe_scene(s2_patch)
+    description = describe_scene(s2_patch, s2_x4=s2_x4, s2_x16=s2_x16)
     print(f"\nScene description:\n{description}\n")
 
     desc_path = OUT / f"{row}_{col}_description.txt"
     desc_path.write_text(description)
     print(f"Saved: {desc_path}")
 
-    # --- 5. Build RAG from web + PDFs and generate mitigations ---
+    # --- 6. Build RAG from web + PDFs and generate mitigations ---
     print("\nBuilding RAG index from EU sources...")
     rag = RAG()
 

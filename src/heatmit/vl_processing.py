@@ -12,34 +12,31 @@ MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"  # HuggingFace repo ID for the 7B visio
 def describe_scene(
     s2_patch: np.ndarray,
     s2_x4: np.ndarray | None = None,
-    s2_x16: np.ndarray | None = None,
     prompt: str | None = None,
 ) -> str:
     """
     Generates a natural language description using Qwen2.5-VL-7B.
-    Accepts up to three resolutions of the same patch (original, 4x, 16x SR).
+    Accepts the original patch and an optional 4x SR version.
 
     Args:
-        s2_patch: original S2 crop, shape (H, W, 4) — bands [B02, B03, B04, B08]
-        s2_x4:   4x SR patch (H*4, W*4, 4), optional
-        s2_x16:  16x SR patch (H*16, W*16, 4), optional
+        s2_patch: original S2 crop (H, W, 4) — [B04,B03,B02,B08] reflectance [0,1] at 10 m/px
+        s2_x4:   4x SR patch (H*4, W*4, 4) at 2.5 m/px, optional
         prompt:  Instruction sent to the model. Built automatically if None.
 
     Returns:
         str: Natural language description of the scene
     """
-    n_images = 1 + (s2_x4 is not None) + (s2_x16 is not None)
+    n_images = 1 + (s2_x4 is not None)
     if prompt is None:
-        if n_images == 3:
+        if n_images == 2:
             prompt = (
                 "You are analyzing Sentinel-2 satellite imagery of the Turin metropolitan area "
-                "(Po Plain, northern Italy), covering a 2.56 km x 2.56 km tile. "
-                "Three co-registered images are provided at increasing resolution: "
-                "Image 1: original at 20 m/px (128 x 128 px). "
-                "Image 2: 4x super-resolved at 5 m/px (512 x 512 px). "
-                "Image 3: 16x super-resolved at 1.25 m/px (2048 x 2048 px). "
+                "(Po Plain, northern Italy), covering a 1.28 km x 1.28 km tile. "
+                "Two co-registered images are provided at increasing resolution: "
+                "Image 1: original at 10 m/px (128 x 128 px). "
+                "Image 2: 4x super-resolved at 2.5 m/px (512 x 512 px) using LDSR-S2. "
                 "All are true-color RGB (B04/B03/B02, ESA Copernicus L2A). "
-                "Using all three images, provide: "
+                "Using both images, provide: "
                 "1. A land cover breakdown with estimated area percentages (e.g. 'Impervious surfaces: 45%'). "
                 "2. Urban morphology: building types (residential/commercial/industrial), density, roof types (flat/pitched/green). "
                 "3. Vegetation: tree canopy, grass, agriculture — type and distribution. "
@@ -48,7 +45,7 @@ def describe_scene(
                 "Be specific — avoid qualitative-only statements like 'mostly urban'."
             )
         else:
-            raise NotImplementedError("Prompt generation for 1 or 2 images is not implemented yet. Please provide a custom prompt.")
+            raise NotImplementedError("Prompt generation for 1 image is not implemented. Please provide a custom prompt.")
 
     device = _get_device()  
     print(f"VLM running on: {device}")
@@ -65,8 +62,6 @@ def describe_scene(
     content = [{"type": "image", "image": _to_image(s2_patch)}]
     if s2_x4 is not None:
         content.append({"type": "image", "image": _to_image(s2_x4)})
-    if s2_x16 is not None:
-        content.append({"type": "image", "image": _to_image(s2_x16)})
     content.append({"type": "text", "text": prompt})  # append the text instruction as the final content item
 
     messages = [{"role": "user", "content": content}]  # wrap in a single-turn chat format expected by Qwen

@@ -1,9 +1,15 @@
 from pathlib import Path
+import os
 import numpy as np
 from PIL import Image
 import torch
+import requests
+from omegaconf import OmegaConf
 
-_OPENSR_CONFIG_URL = "https://raw.githubusercontent.com/ESAOpenSR/opensr-model/refs/heads/main/opensr_model/configs/config_10m.yaml"
+_LDSR_CONFIG_URL = "https://raw.githubusercontent.com/ESAOpenSR/opensr-model/refs/tags/v1.1.1/opensr_model/configs/config_10m.yaml"
+_LDSR_MODEL_DIR = Path(__file__).parent.parent.parent / "model" / "LDSR_S2_10m"
+
+_MODEL_TILE = 128  # LDSR-S2 expects 128x128 input tiles
 
 
 def _get_device() -> str:
@@ -14,48 +20,73 @@ def _get_device() -> str:
         return "cpu"
 
 
-def _run_sr(sr_model, patch_hw4: np.ndarray, device: str, steps: int) -> np.ndarray:
-    """Run one 4× SR pass on a patch of any size by tiling into 128×128 tiles."""
-    H, W, C = patch_hw4.shape
-    assert H % 128 == 0 and W % 128 == 0, "patch dimensions must be multiples of 128"
-    arr = np.clip(patch_hw4.astype(np.float32) / 10_000.0, 0.0, 1.0).transpose(2, 0, 1)  # (C, H, W)
-    out = np.zeros((C, H * 4, W * 4), dtype=np.float32)
-    for r in range(0, H, 128):
-        for c in range(0, W, 128):
-            tile = torch.from_numpy(arr[:, r:r+128, c:c+128]).float().unsqueeze(0).to(device)
-            tile = torch.nan_to_num(tile, nan=0.0, posinf=0.0, neginf=0.0)
-            with torch.no_grad():
-                sr_tile = sr_model.forward(tile, sampling_steps=steps).squeeze(0)
-            out[:, r*4:(r+128)*4, c*4:(c+128)*4] = sr_tile.cpu().numpy()
-    return (out.transpose(1, 2, 0) * 10_000.0).astype(np.float32)  # (H*4, W*4, C)
-
-
-def super_resolve(s2_patch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """16× super-resolve an S2 patch (H, W, 4) [B02,B03,B04,B08] in DN — two 4× passes.
-
-    Returns:
-        x4:  first-pass result  (H*4,  W*4,  4) in DN
-        x16: second-pass result (H*16, W*16, 4) in DN
-    """
-    from io import StringIO
-    import requests
-    from omegaconf import OmegaConf
+def _load_ldsr_model(device: str):
     import opensr_model
 
-    config = OmegaConf.load(StringIO(requests.get(_OPENSR_CONFIG_URL).text))
+    _LDSR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    config_path = _LDSR_MODEL_DIR / "config_10m.yaml"
+    if not config_path.exists():
+        print("Downloading LDSR-S2 config...")
+        response = requests.get(_LDSR_CONFIG_URL, timeout=30)
+        response.raise_for_status()
+        config_path.write_text(response.text)
+
+    config = OmegaConf.load(str(config_path))
+    model = opensr_model.SRLatentDiffusion(config, device=device)
+
+    # load_pretrained builds the HF URL from the bare filename, so cd to model dir
+    # so it downloads/finds the ckpt there
+    orig = os.getcwd()
+    os.chdir(str(_LDSR_MODEL_DIR))
+    try:
+        model.load_pretrained(config.ckpt_version)
+    finally:
+        os.chdir(orig)
+
+    return model
+
+
+def _run_ldsr(model, patch: np.ndarray, device: str, label: str, sampling_steps: int) -> np.ndarray:
+    """Single LDSR-S2 pass on a (H, W, 4) reflectance patch, tiled into _MODEL_TILEx_MODEL_TILE chunks."""
+    H, W, C = patch.shape
+    arr = patch.transpose(2, 0, 1).astype(np.float32)  # (C, H, W)
+    out = np.zeros((C, H * 4, W * 4), dtype=np.float32)
+    n_tiles = ((H + _MODEL_TILE - 1) // _MODEL_TILE) * ((W + _MODEL_TILE - 1) // _MODEL_TILE)
+    tile_idx = 0
+    print(f"SR {label} ({n_tiles} tiles, {sampling_steps} steps each)...")
+    for r in range(0, H, _MODEL_TILE):
+        for c in range(0, W, _MODEL_TILE):
+            raw = arr[:, r:r + _MODEL_TILE, c:c + _MODEL_TILE]
+            th, tw = raw.shape[1], raw.shape[2]
+            if th < _MODEL_TILE or tw < _MODEL_TILE:
+                raw = np.pad(raw, ((0, 0), (0, _MODEL_TILE - th), (0, _MODEL_TILE - tw)), mode="reflect")
+            tile = torch.from_numpy(raw).float().unsqueeze(0).to(device)
+            tile = torch.nan_to_num(tile, nan=0.0, posinf=0.0, neginf=0.0)
+            sr_tile = model.forward(tile, sampling_steps=sampling_steps).squeeze(0).cpu().numpy()
+            out[:, r * 4:r * 4 + th * 4, c * 4:c * 4 + tw * 4] = sr_tile[:, :th * 4, :tw * 4]
+            tile_idx += 1
+            print(f"  tile {tile_idx}/{n_tiles}", end="\r")
+    print()
+    return out.transpose(1, 2, 0).astype(np.float32)  # (H*4, W*4, C)
+
+
+def super_resolve(s2_patch: np.ndarray, sampling_steps: int = 500) -> np.ndarray:
+    """Single 4x LDM SR pass on an S2 patch (H, W, 4) [B04,B03,B02,B08] in reflectance [0,1].
+
+    Uses LDSR-S2 (latent diffusion). Input at 10 m/px -> output at 2.5 m/px.
+
+    Returns:
+        x4: SR result (H*4, W*4, 4) reflectance
+    """
     device = _get_device()
     print(f"SR running on: {device}")
-    sr_model = opensr_model.SRLatentDiffusion(config, device=device)
-    sr_model.load_pretrained(config.ckpt_version)
+    model = _load_ldsr_model(device)
 
-    print("SR pass 1/2 (4x)...")
-    x4 = _run_sr(sr_model, s2_patch, device, steps=500)
-    print("SR pass 2/2 (4x)...")
-    x16 = _run_sr(sr_model, x4, device, steps=500)
+    x4 = _run_ldsr(model, s2_patch, device, "10m -> 2.5m", sampling_steps)
 
-    del sr_model
+    del model
     torch.cuda.empty_cache()
-    return x4, x16
+    return x4
 
 
 def s1_to_grayscale(vv: np.ndarray) -> Image.Image:
@@ -67,17 +98,8 @@ def s1_to_grayscale(vv: np.ndarray) -> Image.Image:
 
 
 def s2_to_rgb(s2_patch: np.ndarray) -> Image.Image:
-    """Convert S2 patch (H, W, 4) with bands [B02, B03, B04, B08] to an RGB PIL image.
-
-    Follows the ESA TCI standard: clip at 0.25 reflectance (2500 DN), then apply
-    sRGB transfer function — identical to what QGIS and EO Browser display.
-    """
-    # B04=RED (idx 2), B03=GREEN (idx 1), B02=BLUE (idx 0); DN → reflectance
-    rgb = np.nan_to_num(s2_patch[:, :, [2, 1, 0]].astype(np.float64) / 10000.0, nan=0.0)
-
-    # Linear stretch: clip at 25% reflectance (ESA TCI saturation point)
-    # Global 2–98 percentile stretch (same scale applied to all channels)
+    """Convert S2 patch (H, W, 4) [B04, B03, B02, B08] in reflectance [0,1] to an RGB PIL image."""
+    rgb = np.nan_to_num(s2_patch[:, :, :3].astype(np.float64), nan=0.0)  # B04=R, B03=G, B02=B
     p2, p98 = np.percentile(rgb, 1), np.percentile(rgb, 99)
     rgb = np.clip((rgb - p2) / (p98 - p2 + 1e-9), 0, 1)
-
     return Image.fromarray((rgb * 255).astype(np.uint8))

@@ -37,6 +37,10 @@ dependencies = [
     "matplotlib>=3.10.9",
     "opensr-model>=1.0.8",
     "omegaconf>=2.3.0",
+    "sen2sr>=0.8.5",
+    "mlstac>=0.4.5",
+    "cubo",
+    "pypdf>=6.11.0",
 ]
 
 # Optional dependencies, use this to include everything that the project needs to run in development.
@@ -68,6 +72,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu124" }
 torchvision = { index = "pytorch-cu124" }
+cubo = { git = "https://github.com/ESDS-Leipzig/cubo.git" }
 
 [tool.hatch.metadata]
 allow-direct-references = true

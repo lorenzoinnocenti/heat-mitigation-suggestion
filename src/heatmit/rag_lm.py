@@ -218,4 +218,5 @@ def suggest_mitigations(scene_description: str, rag: RAG) -> str:
 
     del model, tokenizer, inputs
     torch.cuda.empty_cache()
+    
     return result
